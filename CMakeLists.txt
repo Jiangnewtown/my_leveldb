@@ -17,7 +17,7 @@ endif(NOT CMAKE_C_STANDARD)
 # C++ standard can be overridden when this is used as a sub-project.
 if(NOT CMAKE_CXX_STANDARD)
   # This project requires C++11.
-  set(CMAKE_CXX_STANDARD 11)
+  set(CMAKE_CXX_STANDARD 17)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   set(CMAKE_CXX_EXTENSIONS OFF)
 endif(NOT CMAKE_CXX_STANDARD)
@@ -517,3 +517,21 @@ if(LEVELDB_INSTALL)
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
   )
 endif(LEVELDB_INSTALL)
+
+# 添加 order_example 可执行文件
+add_executable(order_example "example/order_example.cpp")
+target_link_libraries(order_example leveldb)
+
+# 设置 C++17 标准
+set_target_properties(order_example PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+
+# 添加 include 路径
+target_include_directories(order_example PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# 添加 nlohmann/json 依赖
+find_package(nlohmann_json REQUIRED)
+target_link_libraries(order_example nlohmann_json::nlohmann_json)
