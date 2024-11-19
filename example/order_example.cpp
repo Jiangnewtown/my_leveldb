@@ -1250,7 +1250,7 @@ public:
                                              std::numeric_limits<double>::max());
         if (!large_orders.empty()) {
             std::cout << "警告：发现" << large_orders.size() 
-                     << "笔异常大额订单！" << std::endl;
+                     << "笔异常大额订单" << std::endl;
         }
         
         // 检查待支付订单堆积
@@ -1436,6 +1436,164 @@ void testCache(leveldb::DB* db) {
     }
 }
 
+// 修改内存表监控函数
+void monitorMemTableTransition(leveldb::DB* db, size_t write_count = 1000, size_t batch_size = 100) {
+    std::cout << "\n=== 监控内存表转换过程 ===" << std::endl;
+    
+    // 获取初始状态
+    std::cout << "\n初始状态：" << std::endl;
+    printLSMTreeStatus(db);
+    
+    // 记录初始状态
+    std::string stats;
+    size_t initial_mem_usage = 0;
+    if (db->GetProperty("leveldb.approximate-memory-usage", &stats)) {
+        initial_mem_usage = std::stoi(stats);
+    }
+    
+    int initial_level0_files = 0;
+    if (db->GetProperty("leveldb.num-files-at-level0", &stats)) {
+        initial_level0_files = std::stoi(stats);
+    }
+    
+    std::cout << "\n初始配置和状态：" << std::endl;
+    std::cout << "- Write Buffer Size: " << (64 << 20) << " bytes (" << 64 << "MB)" << std::endl;
+    std::cout << "- 初始内存使用: " << (initial_mem_usage / 1024) << "KB" << std::endl;
+    std::cout << "- 初始 Level-0 文件数: " << initial_level0_files << std::endl;
+    std::cout << "- 计划写入记录数: " << write_count << std::endl;
+    std::cout << "- 批次大小: " << batch_size << " 条记录" << std::endl;
+    
+    size_t total_writes = 0;
+    size_t last_mem_usage = initial_mem_usage;
+    size_t last_level0_files = initial_level0_files;
+    size_t memtable_switches = 0;
+    
+    std::cout << "\n开始写入数据并监控状态变化..." << std::endl;
+    std::cout << "\n[时间] [写入量] [内存使用] [Level-0文件数] [状态]" << std::endl;
+    std::cout << "----------------------------------------------------" << std::endl;
+    
+    auto print_status = [](const std::string& time, size_t writes, size_t mem_kb, 
+                          int l0_files, const std::string& status) {
+        std::cout << std::left 
+                 << "[" << std::setw(19) << time << "] "
+                 << "[" << std::setw(8) << writes << "] "
+                 << "[" << std::setw(8) << mem_kb << "KB] "
+                 << "[" << std::setw(13) << l0_files << "] "
+                 << "[" << status << "]" << std::endl;
+    };
+    
+    auto get_current_time = []() {
+        auto now = std::chrono::system_clock::now();
+        auto tt = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << std::put_time(std::localtime(&tt), "%Y-%m-%d %H:%M:%S");
+        return ss.str();
+    };
+    
+    // 打印初始状态
+    print_status(get_current_time(), 0, initial_mem_usage/1024, 
+                initial_level0_files, "初始状态");
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    while (total_writes < write_count) {
+        leveldb::WriteBatch batch;
+        size_t batch_writes = 0;
+        
+        // 生成一批数据
+        for (size_t i = 0; i < batch_size && total_writes < write_count; i++) {
+            Order order;
+            order.order_id = "MONITOR_" + std::to_string(total_writes);
+            order.user_id = "U" + std::to_string(total_writes % 100);
+            order.product_id = "P" + std::to_string(total_writes % 50);
+            order.amount = 100.0 + (total_writes % 900);
+            order.status = "pending";
+            order.create_time = get_current_time();
+            
+            std::string value = order.serialize();
+            batch.Put("order:" + order.order_id, value);
+            total_writes++;
+            batch_writes++;
+        }
+        
+        // 执行批量写入
+        leveldb::Status status = db->Write(leveldb::WriteOptions(), &batch);
+        if (!status.ok()) {
+            std::cerr << "写入失败: " << status.ToString() << std::endl;
+            break;
+        }
+        
+        // 检查状态变化
+        size_t current_mem_usage = 0;
+        if (db->GetProperty("leveldb.approximate-memory-usage", &stats)) {
+            current_mem_usage = std::stoi(stats);
+        }
+        
+        int current_level0_files = 0;
+        if (db->GetProperty("leveldb.num-files-at-level0", &stats)) {
+            current_level0_files = std::stoi(stats);
+        }
+        
+        // 检测显著变化
+        bool significant_change = false;
+        std::string change_type;
+        
+        // 检查内存使用变化（超过1MB）
+        if (std::abs(static_cast<long>(current_mem_usage - last_mem_usage)) > (1 << 20)) {
+            significant_change = true;
+            change_type = "内存使用变化";
+        }
+        
+        // 检查Level-0文件数变化
+        if (current_level0_files > last_level0_files) {
+            significant_change = true;
+            change_type = "MemTable刷盘";
+            memtable_switches++;
+        }
+        
+        if (significant_change) {
+            print_status(get_current_time(), total_writes, 
+                        current_mem_usage/1024, current_level0_files, 
+                        change_type);
+            
+            if (change_type == "MemTable刷盘") {
+                std::cout << "\n=== MemTable 刷盘详情 (#" << memtable_switches << ") ===" << std::endl;
+                printLSMTreeStatus(db);
+                std::cout << "----------------------------------------------------" << std::endl;
+            }
+            
+            last_mem_usage = current_mem_usage;
+            last_level0_files = current_level0_files;
+        }
+        
+        // 短暂休眠，便于观察
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+    
+    // 显示最终统计信息
+    std::cout << "\n=== 写入完成，最终统计 ===" << std::endl;
+    std::cout << "- 总写入记录数: " << total_writes << std::endl;
+    std::cout << "- 总耗时: " << duration.count() << " 秒" << std::endl;
+    std::cout << "- MemTable 转换次数: " << memtable_switches << std::endl;
+    std::cout << "- 最终内存使用: " << (last_mem_usage / 1024) << "KB" << std::endl;
+    std::cout << "- 最终 Level-0 文件数: " << last_level0_files << std::endl;
+    
+    if (duration.count() > 0) {
+        std::cout << "- 平均写入速度: " << (total_writes / duration.count()) << " 条/秒" << std::endl;
+    }
+    
+    // 触发压缩并显示最终状态
+    std::cout << "\n=== 触发手动压缩 ===" << std::endl;
+    db->CompactRange(nullptr, nullptr);
+    
+    std::cout << "\n=== 压缩后最终状态 ===" << std::endl;
+    printLSMTreeStatus(db);
+}
+
+// 在 main 函数中添加测试代码
 int main() {
     // 配置数据库选项
     leveldb::DB* db;
@@ -1616,7 +1774,7 @@ int main() {
         }
     }
 
-    // 在试订单状态更新之前，添加以下��码来创建个试订单
+    // 在试订单状态更新之前，添加以下代码来创建个试订单
     {
         Order test_order;
         test_order.order_id = "TEST_ORDER";
@@ -1787,6 +1945,11 @@ int main() {
 
     // 添加缓存测试
     testCache(db);
+
+    // 添加内存表监控测试
+    std::cout << "\n11. 测试内存表转换过程：" << std::endl;
+    monitorMemTableTransition(db, 2000, 100);  // 写入2000条数据，每批100条
+
 
     // 清理资源
     delete db;
